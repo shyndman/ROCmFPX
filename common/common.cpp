@@ -1330,6 +1330,11 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         cparams.n_batch = cparams.n_ubatch;
         params.n_batch  = params.n_ubatch;
     }
+    if (cparams.attention_type == LLAMA_ATTENTION_TYPE_NON_CAUSAL && cparams.n_ubatch < cparams.n_batch) {
+        LOG_WRN("non-causal attention enabled: setting n_ubatch = n_batch = %u\n", cparams.n_batch);
+        cparams.n_ubatch = cparams.n_batch;
+        params.n_ubatch  = params.n_batch;
+    }
 
     // load and optionally apply lora adapters
     for (auto & la : params.lora_adapters) {

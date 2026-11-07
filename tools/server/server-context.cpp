@@ -525,6 +525,9 @@ struct server_slot {
         if (!task->decision.order.empty() || !other_slot.task->decision.order.empty()) {
             return false;
         }
+        if (!can_split() || !other_slot.can_split()) {
+            return false;
+        }
 
         return task->type == other_slot.task->type
             && inp_embd.size() == other_slot.inp_embd.size()
