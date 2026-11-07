@@ -65,7 +65,7 @@ static std::string decision_qev_strip(const std::string & s) {
 }
 
 static std::string decision_qev_dump(const json & x) {
-    return x.dump(2, ' ', false, json::error_handler_t::replace);
+    return x.dump_safe(2);
 }
 
 static std::string decision_qev_render_entry(const json & e) {
