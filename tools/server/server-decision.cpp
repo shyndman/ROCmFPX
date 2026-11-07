@@ -1780,12 +1780,9 @@ std::vector<server_task> server_decision_group_tasks(std::vector<server_task> &&
             n_shared = std::min(n_shared, parent.tokens.get_common_prefix(tasks[j].tokens));
             n_shared = std::min(n_shared, tasks[j].tokens.size() - 1);
         }
-        for (size_t j = i; j < end; j++) {
-            tasks[j].n_tokens_shared = (int32_t) n_shared;
-        }
-
         if (end - i < 2 || n_shared == 0) {
             for (size_t j = i; j < end; j++) {
+                tasks[j].n_tokens_shared = 0;
                 groups.push_back(std::move(tasks[j]));
             }
             continue;
@@ -1793,6 +1790,7 @@ std::vector<server_task> server_decision_group_tasks(std::vector<server_task> &&
 
         parent.n_tokens_shared = n_shared;
         for (size_t j = i + 1; j < end; j++) {
+            tasks[j].n_tokens_shared = n_shared;
             tasks[j].id_parent = parent.id;
             parent.child_tasks.push_back(std::move(tasks[j]));
         }
