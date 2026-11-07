@@ -23,6 +23,70 @@ static const size_t DECISION_LEV_N_RATINGS = 9;
 // a longer state keeps its head and its tail
 static const size_t DECISION_H2O_MAX_STATE_TOKENS = 32000;
 
+
+// baselabs-qev ("qev-labels-v2"): system prompt, default instructions/criteria, and 256 slot labels
+static const char * DECISION_QEV_SYSTEM_PROMPT =
+    "Apply the question to the state. Choose exactly one of the listed options. "
+    "Respond with only its uppercase letter, with no explanation or reasoning.";
+static const char * DECISION_QEV_NOUL_DEFAULT_INSTRUCTIONS = "Is the statement true, or is the answer to the question yes?";
+static const char * DECISION_QEV_NOUL_DEFAULT_TRUE         = "the statement is true / the answer is yes";
+static const char * DECISION_QEV_NOUL_DEFAULT_FALSE        = "the statement is false / the answer is no";
+static const char * DECISION_QEV_CHOICE_DEFAULT_INSTRUCTIONS = "Which option applies to the state?";
+static const char * DECISION_QEV_SCORE_DEFAULT_INSTRUCTIONS  = "Which level describes the state?";
+
+static std::vector<std::string> decision_qev_default_slot_labels() {
+    static const char * not_one_token[] = {
+        "BQ", "BZ", "CJ", "CQ", "CZ", "DQ", "DZ", "EJ", "EY", "FJ", "FQ", "FV",
+        "FZ", "GJ", "GK", "GQ", "GZ", "HJ", "IY", "JF", "JG", "JH", "JL", "JN", "JQ",
+    };
+    std::vector<std::string> out;
+    for (char c = 'A'; c <= 'Z'; ++c) {
+        out.emplace_back(1, c);
+    }
+    for (char a = 'A'; a <= 'Z' && out.size() < 256; ++a) {
+        for (char b = 'A'; b <= 'Z' && out.size() < 256; ++b) {
+            const std::string s = {a, b};
+            if (std::find_if(std::begin(not_one_token), std::end(not_one_token),
+                    [&](const char * x) { return s == x; }) == std::end(not_one_token)) {
+                out.push_back(s);
+            }
+        }
+    }
+    return out;
+}
+
+static std::string decision_qev_strip(const std::string & s) {
+    const char * ws = " \t\n\r\f\v";
+    const size_t a = s.find_first_not_of(ws);
+    if (a == std::string::npos) {
+        return "";
+    }
+    return s.substr(a, s.find_last_not_of(ws) - a + 1);
+}
+
+static std::string decision_qev_dump(const json & x) {
+    return x.dump(2, ' ', false, json::error_handler_t::replace);
+}
+
+static std::string decision_qev_render_entry(const json & e) {
+    if (e.is_null()) {
+        return "";
+    }
+    if (e.is_string()) {
+        return decision_qev_strip(e.get<std::string>());
+    }
+    return decision_qev_dump(e);
+}
+
+static std::string decision_qev_render_state(const json & s) {
+    if (s.is_null()) {
+        return "";
+    }
+    if (s.is_string()) {
+        return s.get<std::string>();
+    }
+    return decision_qev_dump(s);
+}
 static std::string decision_meta_str(const llama_model * model, const std::string & key) {
     char buf[256];
     const int32_t n = llama_model_meta_val_str(model, key.c_str(), buf, sizeof(buf));
@@ -46,11 +110,15 @@ void server_decision_context::init(const llama_model * model) {
 
     vocab = llama_model_get_vocab(model);
 
-    const char * tmpl_src = llama_model_chat_template(model, "systemone");
-    if (tmpl_src == nullptr) {
-        throw std::runtime_error("decision model has no \"systemone\" template");
+    if (model_type == COMMON_DECISION_TYPE_BASELABS_QEV) {
+        chat_tmpls = std::shared_ptr<common_chat_templates>(common_chat_templates_init(model, ""));
+    } else {
+        const char * tmpl_src = llama_model_chat_template(model, "systemone");
+        if (tmpl_src == nullptr) {
+            throw std::runtime_error("decision model has no \"systemone\" template");
+        }
+        tmpl = std::make_shared<const common_chat_template>(tmpl_src, "", "");
     }
-    tmpl = std::make_shared<const common_chat_template>(tmpl_src, "", "");
 
     const std::string prefix_temp = prefix + "temperature.";
     for (int32_t i = 0; i < llama_model_meta_count(model); i++) {
@@ -201,6 +269,31 @@ void server_decision_context::init(const llama_model * model) {
         }
         n_options_max   = labels.size();
         noul_true_first = true;
+    } else if (model_type == COMMON_DECISION_TYPE_BASELABS_QEV) {
+        std::vector<std::string> raw_labels;
+        for (uint32_t i = 0; llama_model_decision_label(model, i) != nullptr; ++i) {
+            raw_labels.emplace_back(llama_model_decision_label(model, i));
+        }
+        if (raw_labels.empty()) {
+            raw_labels = decision_qev_default_slot_labels();
+        }
+        for (const auto & l : raw_labels) {
+            const auto t = common_tokenize(vocab, l, false, false);
+            if (t.size() != 1 || common_token_to_piece(vocab, t[0], false) != l) {
+                break;
+            }
+            labels.push_back(t[0]);
+            label_texts.push_back(l);
+        }
+        if (labels.size() < 26) {
+            throw std::runtime_error("decision answer letters are not single tokens in this vocabulary");
+        }
+        if (labels.size() < raw_labels.size()) {
+            labels.resize(26);
+            label_texts.resize(26);
+        }
+        n_options_max   = labels.size();
+        noul_true_first = true;
     } else {
         throw std::runtime_error("unsupported decision model type: " + type_name);
     }
@@ -219,7 +312,7 @@ static bool decision_is_payload(const json & val) {
 
 std::vector<server_decision_question> server_decision_context::parse_questions(const json & body) const {
     // lfm2-d1, lfm2-d1-omni and vllm-d3 accept a null state, for example to ask about images only
-    if (!body.contains("state") || (body.at("state").is_null() && type != COMMON_DECISION_TYPE_LFM2_D1 && type != COMMON_DECISION_TYPE_LFM2_D1_OMNI && type != COMMON_DECISION_TYPE_VLLM_D3)) {
+    if (!body.contains("state") || (body.at("state").is_null() && type != COMMON_DECISION_TYPE_LFM2_D1 && type != COMMON_DECISION_TYPE_LFM2_D1_OMNI && type != COMMON_DECISION_TYPE_VLLM_D3 && type != COMMON_DECISION_TYPE_BASELABS_QEV)) {
         throw std::invalid_argument("\"state\" must be provided");
     }
     if (strict_payload && !decision_is_payload(body.at("state"))) {
@@ -240,8 +333,9 @@ std::vector<server_decision_question> server_decision_context::parse_questions(c
         // the vllm-d3 prompt has a default question
         // h2o-lightning: the instructions can be left out, the template has a default, and the type defaults to choice
         const bool is_h2o = type == COMMON_DECISION_TYPE_H2O_LIGHTNING;
-        const json instructions = q.contains("instructions") ? q.at("instructions") : (is_h2o ? json(std::string()) : json());
-        if (instructions.is_null() && type != COMMON_DECISION_TYPE_VLLM_D3 && !is_h2o) {
+        const bool is_qev = type == COMMON_DECISION_TYPE_BASELABS_QEV;
+        const json instructions = q.contains("instructions") ? q.at("instructions") : ((is_h2o || is_qev) ? json(std::string()) : json());
+        if (instructions.is_null() && type != COMMON_DECISION_TYPE_VLLM_D3 && !is_h2o && !is_qev) {
             throw err("\"instructions\" must be provided");
         }
         if (strict_payload && (!decision_is_payload(instructions) || instructions == "")) {
@@ -277,10 +371,10 @@ std::vector<server_decision_question> server_decision_context::parse_questions(c
         } else if (type_name == "score") {
             question.type = SERVER_DECISION_QUESTION_SCORE;
             // h2o-lightning: from 1 level, the maximum is n_options_max
-            if (is_h2o && (!criteria.is_array() || criteria.empty())) {
+            if ((is_h2o || is_qev) && (!criteria.is_array() || criteria.empty())) {
                 throw err("\"criteria\" must be a non-empty array");
             }
-            if (!is_h2o && (!criteria.is_array() || criteria.size() < 2 || criteria.size() > 10)) {
+            if (!is_h2o && !is_qev && (!criteria.is_array() || criteria.size() < 2 || criteria.size() > 10)) {
                 throw err("\"criteria\" must be an array of 2 to 10 levels");
             }
             for (size_t i = 0; i < criteria.size(); i++) {
@@ -823,6 +917,60 @@ json server_decision_context::render_h2o(const json & state, const server_decisi
     return inp;
 }
 
+std::string server_decision_context::render_baselabs_qev(const json & state, const server_decision_question & question, size_t variant) const {
+    const size_t k = question.options.size();
+    std::string instructions = decision_qev_render_entry(question.instructions);
+    if (instructions.empty()) {
+        switch (question.type) {
+            case SERVER_DECISION_QUESTION_NOUL:   instructions = DECISION_QEV_NOUL_DEFAULT_INSTRUCTIONS;   break;
+            case SERVER_DECISION_QUESTION_CHOICE: instructions = DECISION_QEV_CHOICE_DEFAULT_INSTRUCTIONS; break;
+            case SERVER_DECISION_QUESTION_SCORE:  instructions = DECISION_QEV_SCORE_DEFAULT_INSTRUCTIONS;  break;
+        }
+    }
+
+    std::string lines;
+    for (size_t i = 0; i < k; ++i) {
+        const auto & opt = question.options[variant == 0 ? i : k - 1 - i];
+        std::string name;
+        std::string text;
+        if (question.type == SERVER_DECISION_QUESTION_NOUL) {
+            const bool is_true = opt.key == "true";
+            name = is_true ? "yes" : "no";
+            text = opt.description.is_null() ? (is_true ? DECISION_QEV_NOUL_DEFAULT_TRUE : DECISION_QEV_NOUL_DEFAULT_FALSE) :
+                decision_qev_render_entry(opt.description);
+        } else if (question.type == SERVER_DECISION_QUESTION_SCORE) {
+            name = "level " + opt.key;
+            text = decision_qev_render_entry(opt.description);
+        } else {
+            name = opt.key;
+            text = decision_qev_render_entry(opt.description);
+        }
+        lines += (i ? "\n" : "") + label_texts[i] + ". " + (text.empty() ? name : name + ": " + text);
+    }
+
+    std::string letters;
+    for (size_t i = 0; i < k; ++i) {
+        letters += (i ? ", " : "") + label_texts[i];
+    }
+    const std::string header = question.type == SERVER_DECISION_QUESTION_SCORE ? "Rate the state:" : "Question:";
+    const std::string answer = (k <= 26 ? "Answer with one letter: " : "Answer with one label: ") + letters + ".";
+    const std::string suffix = header + " " + instructions + "\n\nOptions:\n" + lines + "\n\n" + answer;
+
+    common_chat_templates_inputs in;
+    common_chat_msg sys;
+    sys.role    = "system";
+    sys.content = DECISION_QEV_SYSTEM_PROMPT;
+    common_chat_msg usr;
+    usr.role    = "user";
+    usr.content = "<state>\n" + decision_qev_render_state(state) + "\n</state>\n\n" + suffix;
+    in.messages              = {sys, usr};
+    in.add_generation_prompt = true;
+    in.use_jinja             = true;
+    in.enable_thinking       = false;
+    in.chat_template_kwargs["enable_thinking"] = "false";
+    return common_chat_templates_apply(chat_tmpls.get(), in).prompt.str();
+}
+
 // given to the lfm2-d1-omni template: text between the pieces of the prompt, and at the start of the pieces that are cut to a token budget
 static const std::string D1OMNI_MARKER        = "<<d1omni:";
 static const std::string D1OMNI_SEP           = "<<d1omni:sep>>";
@@ -988,6 +1136,9 @@ std::string server_decision_context::render(
         size_t variant,
         size_t n_images,
         bool is_audio) const {
+    if (type == COMMON_DECISION_TYPE_BASELABS_QEV) {
+        return render_baselabs_qev(state, question, variant);
+    }
     // the template is given raw JSON values, it serializes the ones that are not strings
     // h2o-lightning: the template is given texts
     json inp = type == COMMON_DECISION_TYPE_H2O_LIGHTNING ? render_h2o(state, question) : json{
@@ -1075,7 +1226,7 @@ void server_decision_context::fill_task(
     const std::string prompt = render(state, questions, question, variant, files.size());
 
     if (type == COMMON_DECISION_TYPE_OPENJEV || type == COMMON_DECISION_TYPE_GRANITE_SWITCH || type == COMMON_DECISION_TYPE_LEV || type == COMMON_DECISION_TYPE_NIMBLE || type == COMMON_DECISION_TYPE_PPLX_DECIDER || type == COMMON_DECISION_TYPE_VLLM_D3 ||
-        type == COMMON_DECISION_TYPE_H2O_LIGHTNING) {
+        type == COMMON_DECISION_TYPE_H2O_LIGHTNING || type == COMMON_DECISION_TYPE_BASELABS_QEV) {
         // lev reads the ratings of a noul question at its first labels, not at the digits
         task.decision.labels.assign(labels.begin(), labels.begin() + n_outputs(question));
     }
@@ -1424,7 +1575,9 @@ float server_decision_context::get_temperature(const server_decision_question & 
 
     // the temperature can depend on the number of options, the buckets are the ones used to fit it
     std::string bucket;
-    if (type == COMMON_DECISION_TYPE_LEV) {
+    if (type == COMMON_DECISION_TYPE_BASELABS_QEV) {
+        bucket = std::to_string(n);
+    } else if (type == COMMON_DECISION_TYPE_LEV) {
         bucket = n <= 8 ? "small" : n <= 26 ? "mid" : "large";
     } else {
         bucket = n <= 2 ? "2" : n <= 5 ? "3_5" : n <= 10 ? "6_10" : "11";

@@ -1176,6 +1176,7 @@ static const std::map<common_decision_type, std::string> COMMON_DECISION_TYPE_NA
     { COMMON_DECISION_TYPE_LFM2_D1_OMNI,   "lfm2-d1-omni"  },
     { COMMON_DECISION_TYPE_GRANITE_SWITCH, "granite-switch"},
     { COMMON_DECISION_TYPE_H2O_LIGHTNING,  "h2o-lightning" },
+    { COMMON_DECISION_TYPE_BASELABS_QEV,   "baselabs-qev"  },
     // for future models, ALWAYS add org name prefix to avoid name collisions, e.g. "orgname-modelname"
 };
 
@@ -1307,6 +1308,19 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         cparams.n_outputs_max_per_seq = 1;
 
         LOG_INF("%s", "decision model reads the embeddings output, enabling embedding mode\n");
+    }
+    if (decision_type == COMMON_DECISION_TYPE_BASELABS_QEV && cparams.attention_type == LLAMA_ATTENTION_TYPE_UNSPECIFIED) {
+        char arch_buf[64];
+        char attn_buf[64];
+        if (llama_model_meta_val_str(model, "general.architecture", arch_buf, sizeof(arch_buf)) >= 0) {
+            const std::string attn_key = std::string(arch_buf) + ".decision.attention";
+            if (llama_model_meta_val_str(model, attn_key.c_str(), attn_buf, sizeof(attn_buf)) >= 0 &&
+                std::string(attn_buf) == "block_bidirectional") {
+                params.attention_type  = LLAMA_ATTENTION_TYPE_NON_CAUSAL;
+                cparams.attention_type = LLAMA_ATTENTION_TYPE_NON_CAUSAL;
+                LOG_INF("%s", "decision model uses block_bidirectional attention, enabling non-causal attention\n");
+            }
+        }
     }
 
     // embeddings need the whole batch in one ubatch, so n_batch must not be larger than n_ubatch

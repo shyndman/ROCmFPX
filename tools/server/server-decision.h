@@ -116,6 +116,7 @@ struct server_decision_context {
 private:
     const llama_vocab * vocab = nullptr;
     std::shared_ptr<const common_chat_template> tmpl; // the "systemone" template
+    std::shared_ptr<common_chat_templates> chat_tmpls; // BASELABS_QEV renders with the default chat template (enable_thinking=false)
 
     std::map<std::string, float> temperatures; // "<type>" or "<type>.<n_options bucket>"
     std::map<size_t, std::vector<float>> score_bias; // added to the scores of a score question, by number of levels
@@ -157,6 +158,7 @@ private:
     std::string h2o_cut_state(const std::string & text) const;
     std::string h2o_quote(const std::string & text) const;
     void fill_task_laya(llama_tokens & tokens, const server_decision_question & question, server_task & task) const;
+    std::string render_baselabs_qev(const json & state, const server_decision_question & question, size_t variant) const;
     void fill_task_d1omni(
             const json & state,
             const std::vector<server_decision_question> & questions,
