@@ -47,6 +47,7 @@ struct server_decision_context {
             case COMMON_DECISION_TYPE_VLLM_DECISION2:
             case COMMON_DECISION_TYPE_LFM2_D1:
             case COMMON_DECISION_TYPE_H2O_LIGHTNING:
+            case COMMON_DECISION_TYPE_BASELABS_QEV:
                 return true;
             default:
                 return false;

@@ -28,6 +28,7 @@ static const size_t DECISION_H2O_MAX_STATE_TOKENS = 32000;
 static const char * DECISION_QEV_SYSTEM_PROMPT =
     "Apply the question to the state. Choose exactly one of the listed options. "
     "Respond with only its uppercase letter, with no explanation or reasoning.";
+static const char * DECISION_QEV_PREFIX_MARK = "QEV_PREFIX_MARK";
 static const char * DECISION_QEV_NOUL_DEFAULT_INSTRUCTIONS = "Is the statement true, or is the answer to the question yes?";
 static const char * DECISION_QEV_NOUL_DEFAULT_TRUE         = "the statement is true / the answer is yes";
 static const char * DECISION_QEV_NOUL_DEFAULT_FALSE        = "the statement is false / the answer is no";
@@ -1263,6 +1264,30 @@ void server_decision_context::fill_task(
         }
         task.decision.pointer = tokens.size() - 1;
     }
+    if (type == COMMON_DECISION_TYPE_BASELABS_QEV) {
+        common_chat_templates_inputs in;
+        common_chat_msg sys;
+        sys.role    = "system";
+        sys.content = DECISION_QEV_SYSTEM_PROMPT;
+        common_chat_msg usr;
+        usr.role    = "user";
+        usr.content = "<state>\n" + decision_qev_render_state(state) + "\n</state>\n\n" + DECISION_QEV_PREFIX_MARK;
+        in.messages              = {sys, usr};
+        in.add_generation_prompt = true;
+        in.use_jinja             = true;
+        in.enable_thinking       = false;
+        in.chat_template_kwargs["enable_thinking"] = "false";
+        const std::string pt = common_chat_templates_apply(chat_tmpls.get(), in).prompt.str();
+        const size_t pos = pt.find(DECISION_QEV_PREFIX_MARK);
+        if (pos != std::string::npos) {
+            const llama_tokens prefix = common_tokenize(vocab, pt.substr(0, pos), false, true);
+            size_t p = std::min(prefix.size(), tokens.size() > 0 ? tokens.size() - 1 : 0);
+            while (p > 0 && !std::equal(prefix.begin(), prefix.begin() + p, tokens.begin())) {
+                --p;
+            }
+            task.n_tokens_shared = (int32_t) p;
+        }
+    }
     task.tokens = server_tokens(tokens, false);
 }
 
@@ -1747,10 +1772,16 @@ std::vector<server_task> server_decision_group_tasks(std::vector<server_task> &&
         server_task & parent = tasks[i];
 
         // every task must have at least one token of its own to evaluate
-        size_t n_shared = parent.tokens.size() - 1;
+        const size_t max_shared = parent.n_tokens_shared > 0 ?
+            std::min((size_t) parent.n_tokens_shared, parent.tokens.size() - 1) :
+            parent.tokens.size() - 1;
+        size_t n_shared = max_shared;
         for (size_t j = i + 1; j < end; j++) {
             n_shared = std::min(n_shared, parent.tokens.get_common_prefix(tasks[j].tokens));
             n_shared = std::min(n_shared, tasks[j].tokens.size() - 1);
+        }
+        for (size_t j = i; j < end; j++) {
+            tasks[j].n_tokens_shared = (int32_t) n_shared;
         }
 
         if (end - i < 2 || n_shared == 0) {

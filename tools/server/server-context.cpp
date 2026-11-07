@@ -491,7 +491,8 @@ struct server_slot {
     bool can_split() const {
         GGML_ASSERT(task);
         // a decision over a non-causal context reads the whole prompt in one batch
-        if (task->type == SERVER_TASK_TYPE_DECISION && !llama_get_causal_attn(ctx_tgt)) {
+        if (task->type == SERVER_TASK_TYPE_DECISION && !llama_get_causal_attn(ctx_tgt) &&
+            task->n_tokens_shared == 0 && !task->is_child()) {
             return false;
         }
         // MTP supports splitting - uses task->need_embd() not need_embd()
@@ -526,6 +527,9 @@ struct server_slot {
             return false;
         }
         if (!can_split() || !other_slot.can_split()) {
+            return false;
+        }
+        if (task->type == SERVER_TASK_TYPE_DECISION && !llama_get_causal_attn(ctx_tgt)) {
             return false;
         }
 
@@ -3982,6 +3986,9 @@ private:
                                 // the outputs of a decision are read from the batch, so its first position must be evaluated
                                 if (n_decision_first >= 0) {
                                     n_past = std::min(n_past, n_decision_first);
+                                }
+                                if (slot.task->type == SERVER_TASK_TYPE_DECISION && !llama_get_causal_attn(ctx_tgt)) {
+                                    n_past = std::min(n_past, slot.task->n_tokens_shared);
                                 }
 
                                 // if there is an alora invoked, don't cache after the invocation start
